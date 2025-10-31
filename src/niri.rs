@@ -56,9 +56,23 @@ impl Niri {
                         return Some(workspace.idx)
                     }
                 }
-            } 
+            }
         }
         None
+    }
+
+    /// Returns workspace indices in their visual order (as arranged in niri)
+    pub fn get_workspace_order(&self) -> Vec<u64> {
+        let reply = request(Request::Workspaces).ok();
+        if let Some(Ok(Response::Workspaces(list_w))) = reply {
+            // The Vec order from niri represents the visual arrangement
+            let order: Vec<u64> = list_w.into_iter().map(|ws| ws.idx as u64).collect();
+            tracing::info!(?order, "workspace order from niri");
+            order
+        } else {
+            tracing::warn!("failed to get workspace order from niri");
+            Vec::new()
+        }
     }
 
     /// Returns a stream of workspace changes.

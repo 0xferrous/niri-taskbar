@@ -84,6 +84,8 @@ struct Instance {
     /// Map of workspace index -> label widget. Each workspace gets exactly one label
     /// shown before the first app icon belonging to that workspace.
     workspace_buttons: BTreeMap<u64, gtk::Button>,
+    /// Map of workspace index -> container Box for grouping workspace button + windows
+    workspace_containers: BTreeMap<u64, gtk::Box>,
     container: gtk::Box,
     last_snapshot: Option<Snapshot>,
     state: State,
@@ -94,6 +96,7 @@ impl Instance {
         Self {
             buttons: Default::default(),
             workspace_buttons: Default::default(),
+            workspace_containers: Default::default(),
             container,
             last_snapshot: None,
             state,
@@ -373,6 +376,8 @@ impl Instance {
         windows: Snapshot,
         filter: Arc<Mutex<output::Filter>>,
     ) {
+        tracing::info!(window_count = windows.len(), "process_window_snapshot called");
+
         // We need to track which, if any, windows are no longer present.
         let mut omitted = self.buttons.keys().copied().collect::<BTreeSet<_>>();
 
@@ -409,18 +414,26 @@ impl Instance {
             }
 
         }
+        tracing::info!(filtered_count = filtered_windows.len(), "after filtering windows");
         for window in filtered_windows.iter().copied() {
             seen_workspaces.insert(window.workspace_idx());
 
-            // If configured, ensure a label exists for this workspace even if the
-            // button already existed; this prevents labels from disappearing when
-            // windows move between workspaces.
+            // Ensure a container exists for this workspace
             let ws_idx = window.workspace_idx();
-            if self.state.config().display_vars().workspace_buttons {
-                if !self.workspace_buttons.contains_key(&ws_idx) {
+            let container_needs_adding = !self.workspace_containers.contains_key(&ws_idx);
+
+            if container_needs_adding {
+                tracing::info!(ws_idx, workspace_buttons = self.state.config().display_vars().workspace_buttons, "creating new workspace container");
+
+                // Create workspace container box
+                let ws_container = gtk::Box::new(Orientation::Horizontal, 0);
+                ws_container.style_context().add_class("workspace-group");
+
+                // If configured, create workspace button
+                if self.state.config().display_vars().workspace_buttons {
+                    tracing::info!(ws_idx, "adding workspace button to container");
                     let button = gtk::Button::with_label(&ws_idx.to_string());
                     button.style_context().add_class("taskbar-button-workspace");
-
 
                     let statec = self.state.clone();
                     button.connect_clicked(move |_| {
@@ -429,20 +442,38 @@ impl Instance {
                         }
                     });
 
-                    self.container.add(&button);
+                    // Add workspace button to its container
+                    ws_container.add(&button);
+
                     self.workspace_buttons.insert(ws_idx, button);
                 }
+
+                self.workspace_containers.insert(ws_idx, ws_container);
             }
 
             let button = match self.buttons.entry(window.id) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
+                    tracing::info!(window_id = window.id, ws_idx, app_id = ?window.app_id, "creating new window button");
                     let button = Button::new(&self.state, window);
-
-                    // We add the widget here; container ordering will be rebuilt below so the
-                    // precise position doesn't matter yet.
-                    self.container.add(button.widget());
                     button.widget().style_context().add_class("taskbar-button-window");
+
+                    // Add window button to its workspace container
+                    if let Some(ws_container) = self.workspace_containers.get(&ws_idx) {
+                        tracing::info!(window_id = window.id, ws_idx, "adding window button to workspace container");
+                        ws_container.add(button.widget());
+
+                        // Add container to main container after first window is added
+                        if container_needs_adding {
+                            tracing::info!(ws_idx, "adding workspace container to main container");
+                            self.container.add(ws_container);
+                        }
+                    } else {
+                        tracing::warn!(window_id = window.id, ws_idx, "no workspace container found, adding to main container");
+                        // Fallback: add to main container if no workspace container exists
+                        self.container.add(button.widget());
+                    }
+
                     entry.insert(button)
                 }
             };
@@ -461,28 +492,29 @@ impl Instance {
         // Remove any windows that no longer exist.
         for id in omitted.into_iter() {
             if let Some(button) = self.buttons.remove(&id) {
-                self.container.remove(button.widget());
+                // In workspace button mode, buttons are in workspace containers, not main container
+                // So we need to search for the button's parent and remove it from there
+                if let Some(parent) = button.widget().parent() {
+                    if let Some(container) = parent.downcast_ref::<gtk::Box>() {
+                        container.remove(button.widget());
+                    }
+                } else {
+                    // Fallback: remove from main container if no parent found
+                    self.container.remove(button.widget());
+                }
             }
         }
 
-        // Remove any workspace labels for workspaces we didn't see.
-        if self.state.config().display_vars().workspace_buttons {
-            let existing_ws: Vec<u64> = self.workspace_buttons.keys().copied().collect();
-            for ws in existing_ws.into_iter() {
-                if !seen_workspaces.contains(&ws) {
-                    if let Some(button) = self.workspace_buttons.remove(&ws) {
-                        self.container.remove(&button);
-                    }
+        // Remove any workspace containers for workspaces we didn't see.
+        let existing_ws: Vec<u64> = self.workspace_containers.keys().copied().collect();
+        for ws in existing_ws.into_iter() {
+            if !seen_workspaces.contains(&ws) {
+                tracing::info!(ws, "removing workspace container for workspace we didn't see");
+                if let Some(ws_container) = self.workspace_containers.remove(&ws) {
+                    self.container.remove(&ws_container);
                 }
-            }
-        } else {
-            // If workspace numbers are disabled, ensure any existing labels are removed
-            // from the container and cleared.
-            if !self.workspace_buttons.is_empty() {
-                // Consume the map so we can remove widgets from the container.
-                let buttons = std::mem::take(&mut self.workspace_buttons);
-                for (_ws, button) in buttons.into_iter() {
-                    self.container.remove(&button);
+                if self.state.config().display_vars().workspace_buttons {
+                    self.workspace_buttons.remove(&ws);
                 }
             }
         }
@@ -495,38 +527,41 @@ impl Instance {
 
                 let (idx, button) = button_t;
 
-                let context = &button.style_context();
+                let button_context = &button.style_context();
 
                 if let Some(active_workspace) = self.state.niri().get_active_workspace_index_output(&output){
                     if *idx == active_workspace as u64 {
-                        context.add_class("focused");
+                        button_context.add_class("focused");
+                        // Also add focused class to the workspace container
+                        if let Some(ws_container) = self.workspace_containers.get(idx) {
+                            ws_container.style_context().add_class("focused");
+                        }
                     } else {
-                        context.remove_class("focused");
+                        button_context.remove_class("focused");
+                        // Remove focused class from the workspace container
+                        if let Some(ws_container) = self.workspace_containers.get(idx) {
+                            ws_container.style_context().remove_class("focused");
+                        }
                     }
                 }
             }
         }
 
-        // Rebuild the container order so that each workspace label appears immediately
-        // before the first app icon that belongs to that workspace.
+        // Rebuild the main container order - use niri's workspace arrangement order
         let mut desired: Vec<gtk::Widget> = Vec::new();
-        let mut pushed_ws: BTreeSet<u64> = Default::default();
 
-        for window in filtered_windows.iter().copied() {
-            let ws_idx = window.workspace_idx();
-            if !pushed_ws.contains(&ws_idx) {
-                if self.state.config().display_vars().workspace_buttons {
-                    if let Some(button) = self.workspace_buttons.get(&ws_idx) {
-                        desired.push(button.clone().upcast::<gtk::Widget>());
-                        pushed_ws.insert(ws_idx);
-                    }
-                }
-            }
+        // Get workspace order from niri (respects visual arrangement)
+        let workspace_order = self.state.niri().get_workspace_order();
+        tracing::info!(?workspace_order, existing_containers = ?self.workspace_containers.keys().collect::<Vec<_>>(), "rebuilding container order");
 
-            if let Some(button) = self.buttons.get(&window.id) {
-                desired.push(button.widget().clone().upcast::<gtk::Widget>());
+        // Use niri's visual order, filtering to only containers that exist
+        for ws_idx in workspace_order {
+            if let Some(ws_container) = self.workspace_containers.get(&ws_idx) {
+                desired.push(ws_container.clone().upcast::<gtk::Widget>());
             }
         }
+
+        tracing::info!(container_count = desired.len(), "containers to display in order");
 
         // Remove all existing children and re-add in the desired order.
         for child in self.container.children() {
